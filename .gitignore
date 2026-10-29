@@ -2,3 +2,4 @@
 books.db
 .venv/
 __pycache__/
+bot.log
