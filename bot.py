@@ -11,7 +11,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, CallbackQuery, Message
+from aiogram.types import BotCommand, CallbackQuery, ForceReply, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -46,6 +46,29 @@ def init_db() -> None:
                 recommend  INTEGER,          -- 1 стоит, 0 не стоит, NULL не указано
                 created_at TEXT    NOT NULL
             )""")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS genres (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                key  TEXT NOT NULL UNIQUE   -- name.casefold(): SQLite не умеет без регистра для кириллицы
+            )""")
+        if con.execute("SELECT COUNT(*) FROM genres").fetchone()[0] == 0:
+            con.executemany("INSERT INTO genres (name, key) VALUES (?, ?)",
+                            [(g, g.casefold()) for g in GENRES])
+
+
+def all_genres() -> list[sqlite3.Row]:
+    with db() as con:
+        # «Другое» всегда в конце, остальные — в порядке добавления
+        return con.execute(
+            "SELECT * FROM genres ORDER BY (name = 'Другое'), id").fetchall()
+
+
+def add_genre(name: str) -> str:
+    """Добавляет жанр (без учёта регистра) и возвращает его каноничное написание."""
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO genres (name, key) VALUES (?, ?)", (name, name.casefold()))
+        return con.execute("SELECT name FROM genres WHERE key = ?", (name.casefold(),)).fetchone()[0]
 
 
 def year_prefix() -> str:
@@ -78,8 +101,9 @@ def parse_book(text: str) -> tuple[str | None, str]:
 # ---------- клавиатуры ----------
 def genre_kb(book_id: int):
     kb = InlineKeyboardBuilder()
-    for i, g in enumerate(GENRES):
-        kb.button(text=g, callback_data=f"g:{book_id}:{i}")
+    for g in all_genres():
+        kb.button(text=g["name"], callback_data=f"g:{book_id}:{g['id']}")
+    kb.button(text="➕ Новый жанр", callback_data=f"gn:{book_id}")
     kb.adjust(3)
     return kb.as_markup()
 
@@ -146,17 +170,64 @@ async def owned_book(cb: CallbackQuery, book_id: int) -> sqlite3.Row | None:
 
 @router.callback_query(F.data.startswith("g:"))
 async def on_genre(cb: CallbackQuery):
-    _, book_id, idx = cb.data.split(":")
+    _, book_id, genre_id = cb.data.split(":")
     b = await owned_book(cb, int(book_id))
     if not b:
         return
-    genre = GENRES[int(idx)] if int(idx) < len(GENRES) else "Другое"
+    with db() as con:
+        row = con.execute("SELECT name FROM genres WHERE id = ?", (int(genre_id),)).fetchone()
+    genre = row["name"] if row else "Другое"
+    await set_genre_and_ask_rec(cb.message, b, genre)
+    await cb.answer()
+
+
+async def set_genre_and_ask_rec(book_msg: Message, b: sqlite3.Row, genre: str) -> None:
     with db() as con:
         con.execute("UPDATE books SET genre = ? WHERE id = ?", (genre, b["id"]))
-    await cb.message.edit_text(
+    await book_msg.edit_text(
         f"📖 {html.escape(b['title'])} — {html.escape(genre)}\nСтоит прочитать?",
         reply_markup=rec_kb(b["id"]))
+
+
+# (chat_id, user_id) -> (book_id, сообщение с кнопками, сообщение-вопрос)
+pending_genre: dict[tuple[int, int], tuple[int, Message, Message]] = {}
+
+
+@router.callback_query(F.data.startswith("gn:"))
+async def on_new_genre(cb: CallbackQuery):
+    b = await owned_book(cb, int(cb.data.split(":")[1]))
+    if not b:
+        return
+    prompt = await cb.message.answer(
+        f"{html.escape(cb.from_user.first_name)}, напиши название нового жанра ответом на это сообщение.",
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Например: Пьеса"))
+    pending_genre[(cb.message.chat.id, cb.from_user.id)] = (b["id"], cb.message, prompt)
     await cb.answer()
+
+
+@router.message(F.text & ~F.text.startswith("/") & F.reply_to_message)
+async def on_genre_text(m: Message):
+    key = (m.chat.id, m.from_user.id)
+    if key not in pending_genre:
+        return
+    book_id, book_msg, prompt = pending_genre[key]
+    if m.reply_to_message.message_id != prompt.message_id:
+        return
+    name = m.text.strip()[:40]
+    if not name:
+        return
+    del pending_genre[key]
+    genre = add_genre(name)
+    with db() as con:
+        b = con.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+    if b is None:
+        await m.reply("Книга уже удалена, но жанр сохранил.")
+        return
+    await set_genre_and_ask_rec(book_msg, b, genre)
+    try:
+        await prompt.delete()
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("r:"))
