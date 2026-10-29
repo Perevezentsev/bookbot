@@ -10,8 +10,8 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, CallbackQuery, ForceReply, Message
+from aiogram.filters import JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command, CommandObject
+from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ForceReply, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -20,7 +20,11 @@ TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = Path(os.getenv("DB_PATH", Path(__file__).with_name("books.db")))
 GENRES = [g.strip() for g in os.getenv(
     "GENRES", "Роман,Драма,Нон-фикшн,Поэзия,Фантастика,Детектив,Другое").split(",") if g.strip()]
-ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()
+# Список разрешённых чатов через запятую. Пусто — бот работает в любом чате.
+# (ALLOWED_CHAT_ID — старое имя, поддерживается для совместимости)
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)   # твой Telegram user id — узнать командой /myid
+ALLOWED_CHAT_IDS = {int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or os.getenv("ALLOWED_CHAT_ID") or "")
+                    .replace(" ", "").split(",") if x}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -47,28 +51,67 @@ def init_db() -> None:
                 created_at TEXT    NOT NULL
             )""")
         con.execute("""
-            CREATE TABLE IF NOT EXISTS genres (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                key  TEXT NOT NULL UNIQUE   -- name.casefold(): SQLite не умеет без регистра для кириллицы
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id    INTEGER PRIMARY KEY,
+                title      TEXT,
+                type       TEXT,
+                first_seen TEXT NOT NULL,
+                last_seen  TEXT NOT NULL,
+                removed    INTEGER NOT NULL DEFAULT 0   -- 1 — бота удалили из чата
             )""")
-        if con.execute("SELECT COUNT(*) FROM genres").fetchone()[0] == 0:
-            con.executemany("INSERT INTO genres (name, key) VALUES (?, ?)",
-                            [(g, g.casefold()) for g in GENRES])
+        # Миграция: раньше жанры были общими (без chat_id) — раздаём их каждому чату с книгами
+        old_cols = [r["name"] for r in con.execute("PRAGMA table_info(genres)")]
+        if old_cols and "chat_id" not in old_cols:
+            con.execute("ALTER TABLE genres RENAME TO genres_old")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS genres (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name    TEXT    NOT NULL,
+                key     TEXT    NOT NULL,   -- name.casefold(): SQLite не умеет без регистра для кириллицы
+                UNIQUE (chat_id, key)
+            )""")
+        if old_cols and "chat_id" not in old_cols:
+            con.execute("""
+                INSERT INTO genres (chat_id, name, key)
+                SELECT c.chat_id, g.name, g.key
+                FROM (SELECT DISTINCT chat_id FROM books) c, genres_old g ORDER BY c.chat_id, g.id""")
+            con.execute("DROP TABLE genres_old")
 
 
-def all_genres() -> list[sqlite3.Row]:
+def all_genres(chat_id: int) -> list[sqlite3.Row]:
     with db() as con:
+        if con.execute("SELECT 1 FROM genres WHERE chat_id = ? LIMIT 1", (chat_id,)).fetchone() is None:
+            # новый чат — заводим стартовый набор жанров
+            con.executemany("INSERT INTO genres (chat_id, name, key) VALUES (?, ?, ?)",
+                            [(chat_id, g, g.casefold()) for g in GENRES])
         # «Другое» всегда в конце, остальные — в порядке добавления
         return con.execute(
-            "SELECT * FROM genres ORDER BY (name = 'Другое'), id").fetchall()
+            "SELECT * FROM genres WHERE chat_id = ? ORDER BY (name = 'Другое'), id",
+            (chat_id,)).fetchall()
 
 
-def add_genre(name: str) -> str:
-    """Добавляет жанр (без учёта регистра) и возвращает его каноничное написание."""
+def add_genre(chat_id: int, name: str) -> str:
+    """Добавляет жанр в чат (без учёта регистра) и возвращает его каноничное написание."""
     with db() as con:
-        con.execute("INSERT OR IGNORE INTO genres (name, key) VALUES (?, ?)", (name, name.casefold()))
-        return con.execute("SELECT name FROM genres WHERE key = ?", (name.casefold(),)).fetchone()[0]
+        con.execute("INSERT OR IGNORE INTO genres (chat_id, name, key) VALUES (?, ?, ?)",
+                    (chat_id, name, name.casefold()))
+        return con.execute("SELECT name FROM genres WHERE chat_id = ? AND key = ?",
+                           (chat_id, name.casefold())).fetchone()[0]
+
+
+def touch_chat(chat, removed: int = 0) -> None:
+    """Запоминает чат и время последней активности в нём."""
+    now = datetime.now().isoformat(timespec="seconds")
+    title = chat.title or chat.full_name or str(chat.id)
+    with db() as con:
+        con.execute("""
+            INSERT INTO chats (chat_id, title, type, first_seen, last_seen, removed)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title = excluded.title, type = excluded.type,
+                last_seen = excluded.last_seen, removed = excluded.removed""",
+            (chat.id, title, chat.type, now, now, removed))
 
 
 def year_prefix() -> str:
@@ -99,9 +142,9 @@ def parse_book(text: str) -> tuple[str | None, str]:
 
 
 # ---------- клавиатуры ----------
-def genre_kb(book_id: int):
+def genre_kb(chat_id: int, book_id: int):
     kb = InlineKeyboardBuilder()
-    for g in all_genres():
+    for g in all_genres(chat_id):
         kb.button(text=g["name"], callback_data=f"g:{book_id}:{g['id']}")
     kb.button(text="➕ Новый жанр", callback_data=f"gn:{book_id}")
     kb.adjust(3)
@@ -119,9 +162,51 @@ def rec_kb(book_id: int):
 # ---------- обработчики ----------
 open_router = Router()   # работает в любом чате
 router = Router()        # только в разрешённом чате
-if ALLOWED_CHAT_ID:
-    router.message.filter(F.chat.id == int(ALLOWED_CHAT_ID))
-    router.callback_query.filter(F.message.chat.id == int(ALLOWED_CHAT_ID))
+if ALLOWED_CHAT_IDS:
+    router.message.filter(F.chat.id.in_(ALLOWED_CHAT_IDS))
+    router.callback_query.filter(F.message.chat.id.in_(ALLOWED_CHAT_IDS))
+    router.my_chat_member.filter(F.chat.id.in_(ALLOWED_CHAT_IDS))
+
+
+@open_router.message(Command("myid"))
+async def cmd_myid(m: Message):
+    await m.reply(f"Твой user id: <code>{m.from_user.id}</code>")
+
+
+@open_router.message(Command("admin"))
+async def cmd_admin(m: Message):
+    if not ADMIN_ID or m.from_user.id != ADMIN_ID:
+        return   # для остальных команды как бы нет
+    y = year_prefix() + "%"
+    with db() as con:
+        tot = con.execute("""
+            SELECT COUNT(DISTINCT chat_id) AS chats, COUNT(DISTINCT user_id) AS users,
+                   COUNT(*) AS books, SUM(created_at LIKE ?) AS books_y FROM books""", (y,)).fetchone()
+        known = con.execute(
+            "SELECT COUNT(*) AS n, SUM(removed = 0) AS active FROM chats").fetchone()
+        rows = con.execute("""
+            SELECT c.chat_id, c.title, c.type, c.first_seen, c.last_seen, c.removed,
+                   COUNT(b.id) AS books, COUNT(DISTINCT b.user_id) AS users,
+                   MAX(b.created_at) AS last_book
+            FROM chats c LEFT JOIN books b ON b.chat_id = c.chat_id
+            GROUP BY c.chat_id ORDER BY c.last_seen DESC LIMIT 20""").fetchall()
+    lines = [
+        "🛠 <b>Админка</b>",
+        f"Чатов с ботом: {known['n']} (активных {known['active'] or 0})",
+        f"Чатов с книгами: {tot['chats']}, читателей: {tot['users']}",
+        f"Книг всего: {tot['books']}, в этом году: {tot['books_y'] or 0}",
+        "",
+        "<b>Последние активные чаты:</b>",
+    ]
+    kinds = {"private": "личка", "group": "группа", "supergroup": "группа", "channel": "канал"}
+    for r in rows:
+        mark = " ❌ удалил бота" if r["removed"] else ""
+        last_book = r["last_book"][:10] if r["last_book"] else "—"
+        lines.append(
+            f"• {html.escape(r['title'] or str(r['chat_id']))} ({kinds.get(r['type'], r['type'])}){mark}\n"
+            f"   книг {r['books']}, читателей {r['users']}, с {r['first_seen'][:10]}, "
+            f"посл. книга {last_book}, активность {r['last_seen'][:10]}")
+    await m.reply("\n".join(lines))
 
 
 @open_router.message(Command("chatid"))
@@ -129,15 +214,29 @@ async def cmd_chatid(m: Message):
     await m.reply(f"ID этого чата: <code>{m.chat.id}</code>")
 
 
-@router.message(Command("start", "help"))
-async def cmd_help(m: Message):
-    await m.reply(
-        "📚 <b>Книжный год</b>\n\n"
+HELP = ("📚 <b>Книжный год</b>\n\n"
         "/add Автор — Название — записать прочитанную книгу\n"
         "/stats — сколько прочитано в этом году\n"
         "/list — все книги этого года\n"
         "/recommend — что стоит прочитать (👍)\n"
-        "/undo — удалить свою последнюю запись")
+        "/undo — удалить свою последнюю запись\n\n"
+        "Работает и в группе, и в личке с ботом. В каждом чате — своя статистика и свои жанры.")
+
+
+@router.message(Command("start", "help"))
+async def cmd_help(m: Message):
+    await m.reply(HELP)
+
+
+@open_router.my_chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
+async def on_removed(event: ChatMemberUpdated):
+    touch_chat(event.chat, removed=1)
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def on_added(event: ChatMemberUpdated, bot: Bot):
+    touch_chat(event.chat)
+    await bot.send_message(event.chat.id, "Привет! Я считаю прочитанные книги.\n\n" + HELP)
 
 
 @router.message(Command("add"))
@@ -153,7 +252,7 @@ async def cmd_add(m: Message, command: CommandObject):
             (m.chat.id, m.from_user.id, m.from_user.first_name, author, title,
              datetime.now().isoformat(timespec="seconds")))
         book_id = cur.lastrowid
-    await m.reply(f"📖 {html.escape(title)}\nКакой жанр?", reply_markup=genre_kb(book_id))
+    await m.reply(f"📖 {html.escape(title)}\nКакой жанр?", reply_markup=genre_kb(m.chat.id, book_id))
 
 
 async def owned_book(cb: CallbackQuery, book_id: int) -> sqlite3.Row | None:
@@ -175,7 +274,8 @@ async def on_genre(cb: CallbackQuery):
     if not b:
         return
     with db() as con:
-        row = con.execute("SELECT name FROM genres WHERE id = ?", (int(genre_id),)).fetchone()
+        row = con.execute("SELECT name FROM genres WHERE id = ? AND chat_id = ?",
+                          (int(genre_id), b["chat_id"])).fetchone()
     genre = row["name"] if row else "Другое"
     await set_genre_and_ask_rec(cb.message, b, genre)
     await cb.answer()
@@ -217,7 +317,7 @@ async def on_genre_text(m: Message):
     if not name:
         return
     del pending_genre[key]
-    genre = add_genre(name)
+    genre = add_genre(m.chat.id, name)
     with db() as con:
         b = con.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
     if b is None:
@@ -317,6 +417,18 @@ async def main():
         BotCommand(command="undo", description="Удалить свою последнюю запись"),
     ])
     dp = Dispatcher()
+
+    @dp.message.outer_middleware()
+    async def track_msg(handler, event: Message, data):
+        touch_chat(event.chat)
+        return await handler(event, data)
+
+    @dp.callback_query.outer_middleware()
+    async def track_cb(handler, event: CallbackQuery, data):
+        if event.message:
+            touch_chat(event.message.chat)
+        return await handler(event, data)
+
     dp.include_routers(open_router, router)
     # drop_pending_updates=False — подхватываем сообщения, пришедшие пока ПК был выключен
     await dp.start_polling(bot, drop_pending_updates=False)
