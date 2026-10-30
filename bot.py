@@ -23,6 +23,7 @@ GENRES = [g.strip() for g in os.getenv(
     "GENRES", "Роман,Драма,Нон-фикшн,Поэзия,Фантастика,Детектив,Другое").split(",") if g.strip()]
 # Список разрешённых чатов через запятую. Пусто — бот работает в любом чате.
 # (ALLOWED_CHAT_ID — старое имя, поддерживается для совместимости)
+GOOGLE_BOOKS_KEY = os.getenv("GOOGLE_BOOKS_KEY", "").strip()   # без ключа Google быстро отвечает 429
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)   # твой Telegram user id — узнать командой /myid
 ALLOWED_CHAT_IDS = {int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or os.getenv("ALLOWED_CHAT_ID") or "")
                     .replace(" ", "").split(",") if x}
@@ -30,6 +31,11 @@ ALLOWED_CHAT_IDS = {int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or os.getenv(
 # ---------- релизы ----------
 # Новый релиз — новая запись В НАЧАЛО списка. После перезапуска бот один раз разошлёт её во все активные чаты.
 RELEASES = [
+    ("1.2.1", "2026-10-30", [
+        "🔎 Поиск книг в Google Books работает стабильнее",
+        "🔧 Книги больше не теряются, когда группа становится супергруппой (например, после назначения бота админом)",
+        "🔎 Бот может попросить уточнить книги, записанные до версии 1.2: выбери вариант — и у карточки появится ✏️",
+    ]),
     ("1.2", "2026-10-30", [
         "✍️ /add теперь спрашивает автора и название по очереди (одной строкой тоже можно)",
         "🔎 Бот находит книгу в Google Books и предлагает правильное написание",
@@ -197,16 +203,25 @@ RATING = {1: "👍", 0: "😐", -1: "👎"}
 async def search_books(query: str, limit: int = 3) -> list[tuple[str | None, str]]:
     """Возвращает до limit вариантов (автор, название) без повторов. При любой ошибке — []."""
     params = {"q": query, "maxResults": "15", "printType": "books"}
-    try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://www.googleapis.com/books/v1/volumes", params=params) as r:
-                if r.status != 200:
-                    logging.warning("Google Books: HTTP %s", r.status)
-                    return []
-                data = await r.json()
-    except Exception as e:
-        logging.warning("Google Books недоступен: %s", e)
+    if GOOGLE_BOOKS_KEY:
+        params["key"] = GOOGLE_BOOKS_KEY
+    data = None
+    for attempt in range(2):   # при 429 (слишком много запросов) — одна повторная попытка
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get("https://www.googleapis.com/books/v1/volumes", params=params) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        break
+                    logging.warning("Google Books: HTTP %s (попытка %s)", r.status, attempt + 1)
+                    if r.status != 429:
+                        return []
+        except Exception as e:
+            logging.warning("Google Books недоступен: %s", e)
+            return []
+        await asyncio.sleep(1.5)
+    if data is None:
         return []
     out, seen = [], set()
     for item in data.get("items", []):
@@ -409,6 +424,59 @@ async def cmd_admin(m: Message):
             f"   книг {r['books']}, читателей {r['users']}, с {r['first_seen'][:10]}, "
             f"посл. книга {last_book}, активность {r['last_seen'][:10]}")
     await m.reply("\n".join(lines))
+
+
+def migrate_chat(old: int, new: int) -> int:
+    """Группа стала супергруппой и сменила ID — переносим всё на новый. Возвращает число книг."""
+    with db() as con:
+        n = con.execute("UPDATE books SET chat_id = ? WHERE chat_id = ?", (new, old)).rowcount
+        con.execute("INSERT OR IGNORE INTO genres (chat_id, name, key) "
+                    "SELECT ?, name, key FROM genres WHERE chat_id = ? ORDER BY id", (new, old))
+        con.execute("DELETE FROM genres WHERE chat_id = ?", (old,))
+        con.execute("UPDATE feedback SET chat_id = ? WHERE chat_id = ?", (new, old))
+        con.execute("UPDATE chats SET removed = 1 WHERE chat_id = ?", (old,))
+    logging.info("Чат %s переехал в %s, перенесено книг: %s", old, new, n)
+    return n
+
+
+@open_router.message(F.migrate_to_chat_id)
+async def on_migrate_to(m: Message):
+    migrate_chat(m.chat.id, m.migrate_to_chat_id)
+
+
+@open_router.message(F.migrate_from_chat_id)
+async def on_migrate_from(m: Message):
+    migrate_chat(m.migrate_from_chat_id, m.chat.id)
+
+
+@open_router.message(Command("reverify"))
+async def cmd_reverify(m: Message):
+    """Админ: предложить авторам уточнить непроверенные книги через Google Books."""
+    if not ADMIN_ID or m.from_user.id != ADMIN_ID:
+        return
+    with db() as con:
+        rows = con.execute("""
+            SELECT b.* FROM books b JOIN chats c ON c.chat_id = b.chat_id AND c.removed = 0
+            WHERE b.verified = 0 ORDER BY b.chat_id, b.id""").fetchall()
+    await m.reply(f"🔎 Непроверенных книг: {len(rows)}. Рассылаю уточнения…")
+    asked = 0
+    for b in rows:
+        query = f"{b['author'] or ''} {b['title']}".strip()
+        candidates = await search_books(query)
+        if not candidates:
+            continue
+        pending_candidates[b["id"]] = candidates
+        try:
+            await m.bot.send_message(
+                b["chat_id"],
+                f'🔎 <a href="tg://user?id={b["user_id"]}">{html.escape(b["user_name"])}</a>, '
+                f"уточни книгу «{book_title_line(b)}» — это какая из них?",
+                reply_markup=verify_kb(b["id"], candidates))
+            asked += 1
+        except Exception as e:
+            logging.warning("reverify %s: %s", b["id"], e)
+        await asyncio.sleep(0.5)
+    await m.answer(f"✅ Отправил уточнений: {asked} из {len(rows)} (для остальных Google ничего не нашёл).")
 
 
 @open_router.message(Command("chatid"))
