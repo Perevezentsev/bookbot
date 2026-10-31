@@ -1,0 +1,47 @@
+# Релиз на GitHub при пуше тега vX.Y.Z.
+# Текст релиза берётся из раздела «## [X.Y.Z]» в CHANGELOG.md,
+# заголовок — из описания тега (git tag -a vX.Y.Z -m "заголовок").
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Текст из CHANGELOG.md
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::В CHANGELOG.md нет раздела «## [$VERSION]» — допиши его и перевыпусти тег"
+            exit 1
+          fi
+
+      - name: Заголовок из описания тега
+        run: |
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          TITLE="$(git tag -l --format='%(contents:subject)' "${GITHUB_REF_NAME}")"
+          echo "TITLE=${TITLE:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+
+      - name: Создать или обновить релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$TITLE" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$TITLE" --notes-file notes.md --verify-tag
+          fi
