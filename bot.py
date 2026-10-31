@@ -29,39 +29,60 @@ ALLOWED_CHAT_IDS = {int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or os.getenv(
                     .replace(" ", "").split(",") if x}
 
 # ---------- релизы ----------
-# Новый релиз — новая запись В НАЧАЛО списка. После перезапуска бот один раз разошлёт её во все активные чаты.
-RELEASES = [
-    ("1.2.1", "2026-10-30", [
-        "🔎 Поиск книг в Google Books работает стабильнее",
-        "🔧 Книги больше не теряются, когда группа становится супергруппой (например, после назначения бота админом)",
-        "🔎 Бот может попросить уточнить книги, записанные до версии 1.2: выбери вариант — и у карточки появится ✏️",
-    ]),
-    ("1.2", "2026-10-30", [
-        "✍️ /add теперь спрашивает автора и название по очереди (одной строкой тоже можно)",
-        "🔎 Бот находит книгу в Google Books и предлагает правильное написание",
-        "😐 Третья реакция — «Нормально», если книга ни туда ни сюда",
-        "✏️ Кнопка на карточке книги — исправить автора, жанр, реакцию или удалить запись",
-        "📚 /list показывает только твои книги",
-        "🏆 /top — самые читаемые книги среди всех пользователей бота (анонимно)",
-        "🧹 Бот убирает за собой команды — в чате остаются только карточки книг",
-        "💡 /feedback — предложить идею или сообщить о проблеме",
-        "🆕 /news — что нового в боте",
-    ]),
-    ("1.1", "2026-10-29", [
-        "➕ Свои жанры: кнопка «Новый жанр» при записи книги",
-        "👥 Бота можно добавить в любую группу или писать ему в личку",
-    ]),
-    ("1.0", "2026-10-29", [
-        "📚 Первая версия: /add, жанр и оценка книги, /stats, /list, /recommend, /undo",
-    ]),
-]
-VERSION = RELEASES[0][0]
+# Единственный источник — CHANGELOG.md рядом с ботом (он же текст GitHub Release по тегу vX.Y.Z).
+# Новый релиз = новый раздел «## [X.Y.Z] — ГГГГ-ММ-ДД» в начале CHANGELOG.md.
+# После перезапуска бот один раз разошлёт его во все активные чаты.
+CHANGELOG_PATH = Path(__file__).with_name("CHANGELOG.md")
+_RELEASE_HEAD = re.compile(r"^## \[(\d+\.\d+\.\d+)\]\s*[—–-]\s*(\d{4}-\d{2}-\d{2})")
 
 
-def release_text(rel) -> str:
-    ver, date, items = rel
-    d = f"{date[8:10]}.{date[5:7]}.{date[:4]}"
-    return f"🆕 <b>Книжный год {ver}</b> · {d}\n" + "\n".join(f"• {html.escape(i)}" for i in items)
+def load_releases(path: Path = CHANGELOG_PATH) -> list[dict]:
+    """Разбирает CHANGELOG.md: [{version, date, summary, sections: [(заголовок, [пункты])]}], новые сверху."""
+    releases: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        logging.error("Нет %s — /news и анонсы релизов не работают", path.name)
+        return releases
+    cur = None
+    for line in lines:
+        m = _RELEASE_HEAD.match(line)
+        if m:
+            cur = {"version": m[1], "date": m[2], "summary": "", "sections": []}
+            releases.append(cur)
+        elif cur is None or not line.strip():
+            continue
+        elif line.startswith("### "):
+            cur["sections"].append((line[4:].strip(), []))
+        elif line.lstrip().startswith("- ") and cur["sections"]:
+            cur["sections"][-1][1].append(line.lstrip()[2:].strip())
+        elif not cur["sections"] and not cur["summary"]:
+            cur["summary"] = line.strip()
+    return releases
+
+
+RELEASES = load_releases()
+VERSION = RELEASES[0]["version"] if RELEASES else "0.0.0"
+
+
+def md_inline(text: str) -> str:
+    """Markdown из CHANGELOG → HTML Telegram: экранирование и `код`.
+    Команды (`/add …`) остаются обычным текстом — так Telegram делает их кликабельными."""
+    def code(m: re.Match) -> str:
+        inner = m.group(1)
+        return inner if inner.startswith("/") else f"<code>{inner}</code>"
+    return re.sub(r"`([^`]+)`", code, html.escape(text))
+
+
+def release_text(rel: dict) -> str:
+    d = rel["date"]
+    out = [f"🆕 <b>Книжный год {rel['version']}</b> · {d[8:10]}.{d[5:7]}.{d[:4]}"]
+    if rel["summary"]:
+        out.append(md_inline(rel["summary"]))
+    for title, items in rel["sections"]:
+        out.append(f"\n<b>{html.escape(title)}</b>")
+        out += [f"• {md_inline(i)}" for i in items]
+    return "\n".join(out)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -726,15 +747,23 @@ async def on_edit_back(cb: CallbackQuery):
 @router.message(Command("news"))
 async def cmd_news(m: Message, command: CommandObject):
     await drop(m)
-    rels = RELEASES if (command.args or "").strip().lower() in ("all", "все") else RELEASES[:1]
-    text = "\n\n".join(release_text(r) for r in rels)
-    if len(rels) == 1 and len(RELEASES) > 1:
+    if not RELEASES:
+        await m.answer("Список изменений пока недоступен.")
+        return
+    if (command.args or "").strip().lower() in ("all", "все"):
+        for rel in RELEASES:   # по сообщению на версию — вся история не влезет в лимит Telegram
+            await m.answer(release_text(rel))
+        return
+    text = release_text(RELEASES[0])
+    if len(RELEASES) > 1:
         text += "\n\n<i>Вся история: /news all</i>"
     await m.answer(text)
 
 
 async def announce_release(bot: Bot) -> None:
     """Один раз рассылает свежий релиз во все активные чаты, где его ещё не видели."""
+    if not RELEASES:
+        return
     with db() as con:
         chats = con.execute(
             "SELECT chat_id FROM chats WHERE removed = 0 AND COALESCE(notified_version, '') != ?",
