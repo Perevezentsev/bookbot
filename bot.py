@@ -204,17 +204,86 @@ def norm(s: str | None) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", s).split())
 
 
+def author_words(author: str | None) -> list[str]:
+    """Значимые слова автора: без инициалов и отчеств."""
+    return [w for w in norm(author).split() if len(w) > 2 and not re.search(r"(вич|вна|ична)$", w)]
+
+
 def author_key(author: str | None) -> str:
     """«Антон Павлович Чехов», «А. П. Чехов», «чехов» -> «чехов».
     Отбрасываем инициалы и отчества, из оставшегося берём последнее слово (фамилию)."""
-    words = [w for w in norm(author).split()
-             if len(w) > 2 and not re.search(r"(вич|вна|ична|ична)$", w)]
+    words = author_words(author)
     return words[-1] if words else ""
 
 
 def book_key(author: str | None, title: str) -> str:
     """Единый ключ книги для статистики по всем чатам: фамилия + название без регистра, ё/е и пунктуации."""
     return f"{author_key(author)}|{norm(title)}"
+
+
+# ---------- нечёткое сравнение книг (опечатки) ----------
+def edits(a: str, b: str) -> int:
+    """Сколько правок отделяет строки: вставка, удаление, замена, перестановка соседних букв."""
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def _close(a: str, b: str, exact_upto: int, one_upto: int) -> int | None:
+    """Число правок, если строки похожи (порог зависит от длины), иначе None.
+    Короткие строки — только точно: «Оно» и «Она» — разные книги."""
+    n = max(len(a), len(b))
+    limit = 0 if n <= exact_upto else 1 if n <= one_upto else 2
+    if abs(len(a) - len(b)) > limit:
+        return None
+    d = edits(a, b)
+    return d if d <= limit else None
+
+
+def match_score(a1: str | None, t1: str, a2: str | None, t2: str) -> int | None:
+    """Похожи ли книги: число правок (0 — одинаковые) или None.
+    Автор: любое слово одного похоже на любое слово другого («Жан-Поль Сартр» ~ «Сартр Жан-Поль»);
+    если автор не указан хотя бы у одной — сравниваем только названия."""
+    td = _close(norm(t1), norm(t2), 4, 10)
+    if td is None:
+        return None
+    w1, w2 = author_words(a1), author_words(a2)
+    if not w1 or not w2:
+        return td
+    ad = [d for x in w1 for y in w2 if (d := _close(x, y, 3, 6)) is not None]
+    return td + min(ad) if ad else None
+
+
+def known_books(exclude_id: int = 0) -> list[sqlite3.Row]:
+    """Все книги бота по одной на book_key — в каноничном написании (как в /top:
+    из проверенной записи, иначе из самой свежей), с числом записей и чатов."""
+    with db() as con:
+        return con.execute("""
+            SELECT id, author, title, book_key, verified, n, chats FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY book_key ORDER BY verified DESC, id DESC) AS rn,
+                       COUNT(*) OVER (PARTITION BY book_key) AS n
+                FROM books WHERE book_key IS NOT NULL AND id != ?)
+            JOIN (SELECT book_key AS k, COUNT(DISTINCT chat_id) AS chats FROM books
+                  WHERE id != ? GROUP BY book_key) ON k = book_key
+            WHERE rn = 1""", (exclude_id, exclude_id)).fetchall()
+
+
+def similar_known(author: str | None, title: str, exclude_id: int = 0, limit: int = 3) -> list[sqlite3.Row]:
+    """Уже записанные в боте книги, похожие на введённую. Первыми — с выверенным написанием
+    (выбрано из Google Books) и самые частые: точное совпадение с чужой опечаткой не должно её закреплять."""
+    found = []
+    for k in known_books(exclude_id):
+        s = match_score(author, title, k["author"], k["title"])
+        if s is not None:
+            found.append((-k["verified"], -k["n"], s, k["id"], k))
+    found.sort(key=lambda x: x[:4])
+    return [x[-1] for x in found[:limit]]
 
 
 RATING = {1: "👍", 0: "😐", -1: "👎"}
@@ -308,13 +377,21 @@ def rec_kb(book_id: int):
     return kb.as_markup()
 
 
-def verify_kb(book_id: int, candidates: list[tuple[str | None, str]]):
+def verify_kb(book_id: int, candidates: list[tuple[str | None, str, str, bool]]):
     kb = InlineKeyboardBuilder()
-    for i, (a, t) in enumerate(candidates):
-        label = f"{a} — {t}" if a else t
+    for i, (a, t, _, known) in enumerate(candidates):
+        label = ("📚 " if known else "") + (f"{a} — {t}" if a else t)
         kb.button(text=label[:60], callback_data=f"v:{book_id}:{i}")
     kb.button(text="✍️ Оставить как написал", callback_data=f"v:{book_id}:-")
     kb.adjust(1)
+    return kb.as_markup()
+
+
+def dup_kb(book_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, добавить", callback_data=f"dp:{book_id}:1")
+    kb.button(text="✖️ Нет, не надо", callback_data=f"dp:{book_id}:0")
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -379,10 +456,44 @@ async def advance(card: Message, b: sqlite3.Row) -> None:
             reply_markup=card_kb(b["id"]))
 
 
+def earlier_copy(b: sqlite3.Row) -> sqlite3.Row | None:
+    """Та же книга (с учётом опечаток), уже записанная этим человеком в этом чате в этом году."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT * FROM books WHERE chat_id = ? AND user_id = ? AND id != ? AND created_at LIKE ? "
+            "ORDER BY id", (b["chat_id"], b["user_id"], b["id"], b["created_at"][:5] + "%")).fetchall()
+    return next((r for r in rows if match_score(b["author"], b["title"], r["author"], r["title"]) is not None),
+                None)
+
+
+async def after_verify(card: Message, b: sqlite3.Row) -> None:
+    """Книга определена. Для новой записи — предупреждаем о повторе, затем ведём карточку дальше."""
+    if b["genre"] is None and b["rating"] is None:   # правку через ✏️ не трогаем
+        old = earlier_copy(b)
+        if old:
+            d = old["created_at"]
+            await card.edit_text(
+                f"📖 {book_title_line(b)}\n{html.escape(b['user_name'])}, ты уже записывал(а) "
+                f"эту книгу {d[8:10]}.{d[5:7]} — всё равно добавить?", reply_markup=dup_kb(b["id"]))
+            return
+    await advance(card, b)
+
+
 # (chat_id, user_id) -> чего ждём: {"step": "author"|"title"|"genre", "prompt": Message, ...}
 pending: dict[tuple[int, int], dict] = {}
-# book_id -> варианты из поиска (живут до перезапуска; после — кнопки работают как «оставить»)
-pending_candidates: dict[int, list[tuple[str | None, str]]] = {}
+# book_id -> варианты (автор, название, book_key, уже есть в боте) — живут до перезапуска;
+# после — кнопки работают как «оставить»
+pending_candidates: dict[int, list[tuple[str | None, str, str, bool]]] = {}
+
+
+async def find_candidates(b: sqlite3.Row, query: str) -> list[tuple[str | None, str, str, bool]]:
+    """Сначала похожие книги, уже записанные в боте, затем новые варианты из Google Books."""
+    known = similar_known(b["author"], b["title"], exclude_id=b["id"])
+    out = [(k["author"], k["title"], k["book_key"], True) for k in known]
+    for a, t in await search_books(query):
+        if not any(match_score(a, t, k["author"], k["title"]) is not None for k in known):
+            out.append((a, t, book_key(a, t), False))
+    return out[:5]
 
 
 async def ask(chat_msg: Message, user, step: str, text: str, placeholder: str, **data) -> None:
@@ -483,7 +594,7 @@ async def cmd_reverify(m: Message):
     asked = 0
     for b in rows:
         query = f"{b['author'] or ''} {b['title']}".strip()
-        candidates = await search_books(query)
+        candidates = await find_candidates(b, query)
         if not candidates:
             continue
         pending_candidates[b["id"]] = candidates
@@ -498,6 +609,119 @@ async def cmd_reverify(m: Message):
             logging.warning("reverify %s: %s", b["id"], e)
         await asyncio.sleep(0.5)
     await m.answer(f"✅ Отправил уточнений: {asked} из {len(rows)} (для остальных Google ничего не нашёл).")
+
+
+# ----- дубли книг (админ) -----
+def similar_pairs(limit: int = 30) -> list[tuple[sqlite3.Row, sqlite3.Row]]:
+    """Пары разных book_key, похожих с учётом опечаток. Первой — книга с большим числом записей."""
+    books = known_books()
+    pairs = []
+    for i, a in enumerate(books):
+        for b in books[i + 1:]:
+            s = match_score(a["author"], a["title"], b["author"], b["title"])
+            if s is not None:
+                pairs.append((s, *sorted((a, b), key=lambda r: (-r["n"], r["id"]))))
+    pairs.sort(key=lambda p: p[0])
+    return [(a, b) for _, a, b in pairs[:limit]]
+
+
+def backup_db() -> Path:
+    """Копия базы рядом с ней: books.db.bak-ГГГГММДД-ЧЧММСС (безопасно при работающем боте)."""
+    path = DB_PATH.with_name(f"{DB_PATH.name}.bak-{datetime.now():%Y%m%d-%H%M%S}")
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(path)
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    return path
+
+
+def merge_books(keep_id: int, drop_id: int) -> tuple[int, Path] | None:
+    """Все записи книги drop_id получают написание и book_key книги keep_id. None — записи пропали."""
+    keep, drop_ = get_book(keep_id), get_book(drop_id)
+    if not keep or not drop_ or keep["book_key"] == drop_["book_key"]:
+        return None
+    path = backup_db()
+    with db() as con:
+        n = con.execute("UPDATE books SET author = ?, title = ?, book_key = ? WHERE book_key = ?",
+                        (keep["author"], keep["title"], keep["book_key"], drop_["book_key"])).rowcount
+        # написание подтвердил админ — /reverify про эти записи больше не спрашивает
+        con.execute("UPDATE books SET verified = 1 WHERE book_key = ?", (keep["book_key"],))
+    logging.info("Слияние книг: %s -> %s, записей %s, бэкап %s", drop_["book_key"], keep["book_key"], n, path.name)
+    return n, path
+
+
+def is_admin(user) -> bool:
+    return bool(ADMIN_ID) and user.id == ADMIN_ID
+
+
+@open_router.message(Command("dups"))
+async def cmd_dups(m: Message):
+    """Админ: похожие книги (опечатки) по всем чатам — выбрать написание и слить."""
+    if not is_admin(m.from_user):
+        return
+    pairs = similar_pairs()
+    if not pairs:
+        await m.reply("👯 Похожих книг не нашёл.")
+        return
+    text = "👯 <b>Похожие книги</b>. Выбери, какое написание оставить:\n"
+    kb = InlineKeyboardBuilder()
+    for i, (a, b) in enumerate(pairs, 1):
+        item = (f"\n<b>{i}.</b> А: {book_title_line(a)} <i>({a['n']} зап., чатов {a['chats']})</i>\n"
+                f"    Б: {book_title_line(b)} <i>({b['n']} зап., чатов {b['chats']})</i>\n")
+        if len(text) + len(item) > 3800:   # лимит Telegram — 4096; остальное — после слияния этих
+            text += f"\n…и ещё пар: {len(pairs) - i + 1}"
+            break
+        text += item
+        kb.button(text=f"{i}: оставить А", callback_data=f"dm:{a['id']}:{b['id']}")
+        kb.button(text=f"{i}: оставить Б", callback_data=f"dm:{b['id']}:{a['id']}")
+    kb.adjust(2)
+    await m.reply(text, reply_markup=kb.as_markup())
+
+
+@open_router.callback_query(F.data.startswith("dm:"))
+async def on_dups_pick(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return await cb.answer()
+    _, keep_id, drop_id = cb.data.split(":")
+    keep, drop_ = get_book(int(keep_id)), get_book(int(drop_id))
+    if not keep or not drop_ or keep["book_key"] == drop_["book_key"]:
+        return await cb.answer("Список устарел — вызови /dups заново", show_alert=True)
+    with db() as con:
+        r = con.execute("SELECT COUNT(*) AS n, COUNT(DISTINCT chat_id) AS chats FROM books WHERE book_key = ?",
+                        (drop_["book_key"],)).fetchone()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Слить", callback_data=f"dmy:{keep_id}:{drop_id}")
+    kb.button(text="✖️ Отмена", callback_data="dmn")
+    await cb.message.answer(
+        f"Изменится записей: <b>{r['n']}</b> в чатах: <b>{r['chats']}</b>\n"
+        f"«{book_title_line(drop_)}» → «{book_title_line(keep)}»\n"
+        f"Перед слиянием сделаю копию базы. Сливаем?", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@open_router.callback_query(F.data.startswith("dmy:"))
+async def on_dups_merge(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return await cb.answer()
+    _, keep_id, drop_id = cb.data.split(":")
+    res = merge_books(int(keep_id), int(drop_id))
+    if res is None:
+        await cb.message.edit_text("Уже слито или записи удалены — вызови /dups заново.")
+    else:
+        n, path = res
+        await cb.message.edit_text(f"✅ Слито записей: {n}. Копия базы: <code>{html.escape(path.name)}</code>\n"
+                                   f"Обновить список: /dups")
+    await cb.answer()
+
+
+@open_router.callback_query(F.data == "dmn")
+async def on_dups_cancel(cb: CallbackQuery):
+    if not is_admin(cb.from_user):
+        return await cb.answer()
+    await cb.message.edit_text("Слияние отменено.")
+    await cb.answer()
 
 
 @open_router.message(Command("chatid"))
@@ -563,13 +787,14 @@ async def save_and_search(chat_msg: Message, user, author: str | None, title: st
 
 async def search_into_card(card: Message, b: sqlite3.Row, query: str) -> None:
     query = re.sub(r"\s+[—–-]\s+", " ", query)
-    candidates = await search_books(query)
+    candidates = await find_candidates(b, query)
     if candidates:
         pending_candidates[b["id"]] = candidates
-        await card.edit_text(f"🔎 {html.escape(b['user_name'])}, это какая книга?",
+        note = "\n📚 — уже записывали в боте" if any(c[3] for c in candidates) else ""
+        await card.edit_text(f"🔎 {html.escape(b['user_name'])}, это какая книга?{note}",
                              reply_markup=verify_kb(b["id"], candidates))
     else:
-        await advance(card, b)
+        await after_verify(card, b)
 
 
 async def owned_book(cb: CallbackQuery, book_id: int) -> sqlite3.Row | None:
@@ -591,12 +816,31 @@ async def on_verify(cb: CallbackQuery):
         return
     candidates = pending_candidates.pop(b["id"], [])
     if choice != "-" and choice.isdigit() and int(choice) < len(candidates):
-        author, title = candidates[int(choice)]
+        author, title, key, _ = candidates[int(choice)]   # для книги из бота — её написание и ключ
         with db() as con:
             con.execute("UPDATE books SET author = ?, title = ?, book_key = ?, verified = 1 WHERE id = ?",
-                        (author, title, book_key(author, title), b["id"]))
-    await advance(cb.message, get_book(b["id"]))
+                        (author, title, key, b["id"]))
+    await after_verify(cb.message, get_book(b["id"]))
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("dp:"))
+async def on_duplicate(cb: CallbackQuery):
+    _, book_id, keep = cb.data.split(":")
+    b = await owned_book(cb, int(book_id))
+    if not b:
+        return
+    if keep == "1":
+        await advance(cb.message, b)
+        await cb.answer()
+        return
+    with db() as con:
+        con.execute("DELETE FROM books WHERE id = ?", (b["id"],))
+    await cb.answer("Не добавил — книга уже есть в списке")
+    try:
+        await cb.message.delete()
+    except Exception:
+        await cb.message.edit_text(f"✖️ Не добавлено: {book_title_line(b)}")
 
 
 @router.callback_query(F.data.startswith("g:"))
