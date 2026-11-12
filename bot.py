@@ -11,6 +11,7 @@ from pathlib import Path
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.filters import JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command, CommandObject
 from aiogram.types import BotCommand, CallbackQuery, ChatMemberUpdated, ForceReply, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -29,6 +30,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)   # твой Telegram user id — у�
 WIKIDATA_UA = "knizhny-god-bot/1.4 (https://github.com/Perevezentsev/bookbot)"
 WIKIDATA_TIMEOUT = 4     # секунд на запрос — диалог не должен подвисать
 CHAIN_TTL_MIN = 30       # через сколько минут брошенная запись книги убирается из чата
+DOWNTIME_MIN = 5         # простой дольше этого — после старта пишем админу в личку
+ALIVE_PATH = Path(__file__).with_name(".alive")   # метка «бот жив», обновляется раз в минуту
+LOG_PATH = Path(__file__).with_name("bot.log")    # сюда пишет run.sh
 ALLOWED_CHAT_IDS = {int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or os.getenv("ALLOWED_CHAT_ID") or "")
                     .replace(" ", "").split(",") if x}
 
@@ -1904,19 +1908,102 @@ async def cmd_undo(m: Message):
                    else f"{mention(m.from_user)}, у тебя нет записей.")
 
 
+# ---------- старт и живучесть ----------
+COMMANDS = [
+    BotCommand(command="add", description="Записать прочитанную книгу"),
+    BotCommand(command="list", description="Мои книги этого года"),
+    BotCommand(command="stats", description="Сколько прочитано в этом году"),
+    BotCommand(command="recommend", description="Что стоит прочитать"),
+    BotCommand(command="top", description="Топ книг среди всех читателей"),
+    BotCommand(command="undo", description="Удалить свою последнюю запись"),
+    BotCommand(command="feedback", description="Предложить идею или сообщить о проблеме"),
+    BotCommand(command="news", description="Что нового в боте"),
+]
+NET_ERRORS = (TelegramNetworkError, TelegramServerError, aiohttp.ClientError, asyncio.TimeoutError, OSError)
+_LOG_TIME = re.compile(rb"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+async def until_online(what: str, call):
+    """Повторяет сетевой вызов с нарастающей паузой (5 с … 5 мин), пока Telegram не ответит.
+    Нужно на старте: после пробуждения ПК сеть поднимается не сразу."""
+    delay = 5
+    while True:
+        try:
+            return await call()
+        except NET_ERRORS as e:
+            logging.warning("%s: нет связи с Telegram (%s: %s), повтор через %s с",
+                            what, type(e).__name__, e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+
+
+def last_alive() -> datetime | None:
+    """Когда бот последний раз точно работал: метка .alive, а если её нет — последняя строка лога."""
+    try:
+        return datetime.fromtimestamp(ALIVE_PATH.stat().st_mtime)
+    except OSError:
+        pass
+    try:
+        with LOG_PATH.open("rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - 65536))
+            for line in reversed(f.read().splitlines()):
+                if m := _LOG_TIME.match(line):
+                    return datetime.fromisoformat(m[1].decode())
+    except OSError:
+        pass
+    return None
+
+
+def touch_alive() -> None:
+    try:
+        ALIVE_PATH.touch()
+    except OSError as e:
+        logging.warning("Метка .alive не обновлена: %s", e)
+
+
+async def heartbeat() -> None:
+    while True:
+        touch_alive()
+        await asyncio.sleep(60)
+
+
+def span_text(d: timedelta) -> str:
+    mins = int(d.total_seconds() // 60)
+    days, mins = divmod(mins, 1440)
+    hours, mins = divmod(mins, 60)
+    parts = [f"{days} д" if days else "", f"{hours} ч" if hours else "", f"{mins} мин" if mins or not (days or hours) else ""]
+    return " ".join(p for p in parts if p)
+
+
+async def report_downtime(bot: Bot, since: datetime | None) -> None:
+    """Пишет админу в личку, если бот простоял дольше DOWNTIME_MIN, — чтобы узнавать не от пользователей."""
+    now = datetime.now()
+    if not ADMIN_ID or since is None or now - since < timedelta(minutes=DOWNTIME_MIN):
+        return
+    text = (f"✅ Бот снова работает, был недоступен с {since:%d.%m %H:%M} до {now:%d.%m %H:%M} "
+            f"({span_text(now - since)}). Подробности — в bot.log.")
+    logging.info("Простой с %s до %s", since.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"))
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        logging.warning("Сообщение о простое не доставлено: %s", e)
+
+
 async def main():
     init_db()
+    down_since = last_alive()   # читаем до того, как сами начнём писать в лог и в .alive
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    await bot.set_my_commands([
-        BotCommand(command="add", description="Записать прочитанную книгу"),
-        BotCommand(command="list", description="Мои книги этого года"),
-        BotCommand(command="stats", description="Сколько прочитано в этом году"),
-        BotCommand(command="recommend", description="Что стоит прочитать"),
-        BotCommand(command="top", description="Топ книг среди всех читателей"),
-        BotCommand(command="undo", description="Удалить свою последнюю запись"),
-        BotCommand(command="feedback", description="Предложить идею или сообщить о проблеме"),
-        BotCommand(command="news", description="Что нового в боте"),
-    ])
+    try:
+        await run(bot, down_since)
+    finally:
+        await bot.session.close()   # и при падении, и при остановке — без «Unclosed client session»
+
+
+async def run(bot: Bot, down_since: datetime | None) -> None:
+    await until_online("Старт", bot.me)   # start_polling тоже зовёт me(); ответ кэшируется
+    await until_online("Команды бота", lambda: bot.set_my_commands(COMMANDS))
+    touch_alive()
+    await report_downtime(bot, down_since)
     dp = Dispatcher()
 
     @dp.message.outer_middleware()
@@ -1934,6 +2021,7 @@ async def main():
     await migrate_authors()   # старые записи -> авторы; без сети — попробуем при следующем запуске
     asyncio.create_task(announce_release(bot))
     asyncio.create_task(sweep_chains(bot))
+    asyncio.create_task(heartbeat())
     # drop_pending_updates=False — подхватываем сообщения, пришедшие пока ПК был выключен
     await dp.start_polling(bot, drop_pending_updates=False)
 
